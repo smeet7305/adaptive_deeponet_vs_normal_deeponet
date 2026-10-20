@@ -316,44 +316,62 @@ def plot_unrolled_chain(res, save_path):
     """
     Plots the unrolled chain graph solution across all 7 edges at time snapshots:
     t = 0.00, 0.25, 0.50, 0.75, 1.00
-    matching Figure 6 in the paper!
+    matching Figure 6 in the paper (Blechschmidt et al., ICML 2025)!
     """
     v_ref = res['v_ref']
     v_pred = res['v_pred']
     ne = res['ne']
     times_idx = [0, 25, 50, 75, 100]
     time_labels = ['0.00', '0.25', '0.50', '0.75', '1.00']
+    colors = [
+        '#1f77b4', # Edge 0: Blue
+        '#2ca02c', # Edge 1: Green
+        '#d62728', # Edge 2: Red
+        '#9467bd', # Edge 3: Purple
+        '#8c564b', # Edge 4: Brown
+        '#e377c2', # Edge 5: Pink
+        '#ff7f0e', # Edge 6: Orange
+    ]
 
-    fig, axes = plt.subplots(len(times_idx), 1, figsize=(11, 10), sharex=True, sharey=True)
+    fig, axes = plt.subplots(len(times_idx), 1, figsize=(6.5, 9.5), sharex=True, sharey=True)
     x_local = np.linspace(0, 1, 101)
 
     for row_idx, (t_idx, t_lbl) in enumerate(zip(times_idx, time_labels)):
         ax = axes[row_idx]
-        x_unrolled = []
-        ref_unrolled = []
-        pred_unrolled = []
 
         for e in range(ne):
             x_e = x_local + e
             ref_e = v_ref[e, :, t_idx]
             pred_e = v_pred[e, :, t_idx]
-            x_unrolled.extend(x_e)
-            ref_unrolled.extend(ref_e)
-            pred_unrolled.extend(pred_e)
 
-        ax.plot(x_unrolled, ref_unrolled, 'k-', linewidth=1.8, label='Reference (FVM)' if row_idx == 0 else "")
-        ax.plot(x_unrolled, pred_unrolled, 'r--', linewidth=1.8, label='PI DeepONet' if row_idx == 0 else "")
-        ax.set_ylabel(f't = {t_lbl}', fontsize=11, fontweight='bold')
-        ax.set_ylim(-0.05, 1.05)
-        ax.grid(True, linestyle=':', alpha=0.6)
-        if row_idx == 0:
-            ax.set_title(f"Chain Graph G1 (7 Edges): Reference FVM (Solid) vs PI DeepONet (Dashed)\nRelative Space-Time L2 Error = {res['l2_rel']:.2%}", fontsize=12, fontweight='bold')
-            ax.legend(loc='upper right', framealpha=0.95)
+            # Reference solution (solid line)
+            ax.plot(x_e, ref_e, color=colors[e % len(colors)], linestyle='-', linewidth=2.2,
+                    label='Reference (FVM)' if (row_idx == 0 and e == 0) else '')
+            # PI DeepONet solution (dashed line directly on top)
+            ax.plot(x_e, pred_e, color='black', linestyle=(0, (4, 3)), linewidth=1.4, alpha=0.85,
+                    label='PI DeepONet' if (row_idx == 0 and e == 0) else '')
+            ax.plot(x_e, pred_e, color=colors[e % len(colors)], linestyle=(0, (4, 3)), linewidth=2.2, alpha=0.9)
 
-    axes[-1].set_xlabel('Unrolled Edge Coordinates (Edge Index)', fontsize=11, fontweight='bold')
+        ax.set_ylabel(f't={t_lbl}', fontsize=11, fontweight='bold', labelpad=8)
+        ax.set_ylim(-0.02, 1.05)
+        ax.set_yticks([0.0, 0.5, 1.0])
+        ax.set_yticklabels(['0.0', '0.5', '1.0'], fontsize=10)
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(direction='out', length=4, width=1.0)
+
+        for b in range(1, ne):
+            ax.axvline(b, color='#e0e0e0', linestyle=':', linewidth=0.8, zorder=0)
+
+    axes[0].legend(loc='upper right', frameon=True, framealpha=0.9, fontsize=9)
+    axes[-1].set_xlim(-0.15, ne + 0.15)
     axes[-1].set_xticks(range(ne + 1))
+    axes[-1].set_xticklabels([str(i) for i in range(ne + 1)], fontsize=10)
+    axes[-1].set_xlabel('Unrolled Graph Coordinate (Edges 0 to 6)', fontsize=11, labelpad=6)
+
     plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved snapshot plot to: {save_path}")
 
