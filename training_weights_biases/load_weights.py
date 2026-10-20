@@ -40,6 +40,18 @@ def load_torch_weights(model_type='inner'):
     path = os.path.join(WEIGHTS_DIR, f'{model_type}_weights_biases.pt')
     return torch.load(path, weights_only=True)
 
+def load_pretrained_model(model_type='inner'):
+    """
+    Load fully assembled PyTorch PretrainedDeepONet model initialized with weights.
+    model_type: 'inflow', 'inner', or 'outflow'
+    """
+    import sys
+    engine_dir = os.path.join(os.path.dirname(WEIGHTS_DIR), 'Engine')
+    if engine_dir not in sys.path:
+        sys.path.insert(0, engine_dir)
+    from QGPINNs_Engine import PretrainedDeepONet
+    return PretrainedDeepONet(model_type=model_type, weights_dir=WEIGHTS_DIR)
+
 if __name__ == '__main__':
     meta = get_metadata()
     print("=== DeepONet Model Metadata ===")

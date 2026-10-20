@@ -255,15 +255,229 @@ class DeepONet(nn.Module):
         )
 
     def forward(self, branch_input, trunk_input):
-
         b = self.branch(branch_input)
-
         if self.use_fourier:
             trunk_input = self.trunk_fourier(trunk_input)
-
         t = self.trunk(trunk_input)
-
+        if b.ndim == 1:
+            b = b.unsqueeze(0)
+        if b.shape[0] != t.shape[0]:
+            b = b.expand(t.shape[0], -1)
         return torch.sum(b * t, dim=-1, keepdim=True) + self.bias
+
+
+class PretrainedDeepONet(nn.Module):
+    """
+    Physics-Informed DeepONet using trained & frozen weights and biases from training_weights_biases/.
+    Architecture:
+      - Branch Network: Modified MLP (Wang et al. 2021) with 7 hidden layers of width 200, input dim 304,
+                        and linear transformation projections U and V.
+      - Trunk Network: Fourier Feature MLP with 6 hidden layers of width 200, input dim 2 (t, x),
+                       embedded via 100 random Fourier frequencies.
+    """
+    def __init__(self, model_type='inner', weights_dict=None, weights_dir=None, u_branch=None):
+        super().__init__()
+        self.model_type = str(model_type).lower()
+        if weights_dir is None:
+            cand = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'training_weights_biases')
+            if os.path.exists(cand):
+                weights_dir = cand
+            else:
+                weights_dir = 'training_weights_biases'
+        self.weights_dir = weights_dir
+
+        # Load Fourier random frequencies
+        ff_path = os.path.join(weights_dir, 'trunk_fourier_frequencies.npy')
+        if os.path.exists(ff_path):
+            FF_np = np.load(ff_path)
+        else:
+            FF_np = np.random.RandomState(0).randn(2, 100).astype(np.float32) * 5.0
+        self.register_buffer('FF', torch.tensor(FF_np, dtype=torch.float32))
+
+        # Branch input buffer (304 sensor/velocity values)
+        if u_branch is not None:
+            if not torch.is_tensor(u_branch):
+                u_branch = torch.tensor(u_branch, dtype=torch.float32)
+            if u_branch.ndim == 1:
+                u_branch = u_branch.unsqueeze(0)
+            self.register_buffer('u_branch', u_branch)
+        else:
+            self.register_buffer('u_branch', torch.zeros((1, 304), dtype=torch.float32))
+
+        self._build_layers()
+
+        if weights_dict is not None:
+            self.load_weights_dict(weights_dict)
+        elif weights_dir is not None and os.path.exists(weights_dir):
+            self.load_pretrained_from_dir(weights_dir, self.model_type)
+
+    def _build_layers(self):
+        m = 304
+        w = 200
+        # Branch modified MLP parameters
+        self.branch_U_w = nn.Parameter(torch.zeros(m, w, dtype=torch.float32))
+        self.branch_U_b = nn.Parameter(torch.zeros(w, dtype=torch.float32))
+        self.branch_V_w = nn.Parameter(torch.zeros(m, w, dtype=torch.float32))
+        self.branch_V_b = nn.Parameter(torch.zeros(w, dtype=torch.float32))
+
+        self.branch_layers_w = nn.ParameterList([
+            nn.Parameter(torch.zeros(m if i == 0 else w, w, dtype=torch.float32))
+            for i in range(7)
+        ])
+        self.branch_layers_b = nn.ParameterList([
+            nn.Parameter(torch.zeros(w, dtype=torch.float32))
+            for i in range(7)
+        ])
+
+        # Trunk Fourier Feature MLP parameters
+        self.trunk_layers_w = nn.ParameterList([
+            nn.Parameter(torch.zeros(w, w, dtype=torch.float32))
+            for i in range(6)
+        ])
+        self.trunk_layers_b = nn.ParameterList([
+            nn.Parameter(torch.zeros(w, dtype=torch.float32))
+            for i in range(6)
+        ])
+
+    def load_weights_dict(self, weights):
+        with torch.no_grad():
+            self.branch_U_w.copy_(torch.as_tensor(weights['branch_U_weight'], dtype=torch.float32))
+            self.branch_U_b.copy_(torch.as_tensor(weights['branch_U_bias'], dtype=torch.float32))
+            self.branch_V_w.copy_(torch.as_tensor(weights['branch_V_weight'], dtype=torch.float32))
+            self.branch_V_b.copy_(torch.as_tensor(weights['branch_V_bias'], dtype=torch.float32))
+
+            for i in range(7):
+                self.branch_layers_w[i].copy_(torch.as_tensor(weights[f'branch_layer_{i}_weight'], dtype=torch.float32))
+                self.branch_layers_b[i].copy_(torch.as_tensor(weights[f'branch_layer_{i}_bias'], dtype=torch.float32))
+
+            for i in range(6):
+                self.trunk_layers_w[i].copy_(torch.as_tensor(weights[f'trunk_layer_{i}_weight'], dtype=torch.float32))
+                self.trunk_layers_b[i].copy_(torch.as_tensor(weights[f'trunk_layer_{i}_bias'], dtype=torch.float32))
+
+    def load_pretrained_from_dir(self, weights_dir, model_type='inner'):
+        all_pt = os.path.join(weights_dir, 'all_edge_models_frozen.pt')
+        if os.path.exists(all_pt):
+            data = torch.load(all_pt, weights_only=True, map_location='cpu')
+            if model_type in data:
+                self.load_weights_dict(data[model_type])
+                return
+        single_pt = os.path.join(weights_dir, f'{model_type}_weights_biases.pt')
+        if os.path.exists(single_pt):
+            data = torch.load(single_pt, weights_only=True, map_location='cpu')
+            self.load_weights_dict(data)
+            return
+        single_npz = os.path.join(weights_dir, f'{model_type}_weights_biases.npz')
+        if os.path.exists(single_npz):
+            data = np.load(single_npz)
+            self.load_weights_dict({k: data[k] for k in data.files})
+
+    def set_branch_input(self, u_branch):
+        if not torch.is_tensor(u_branch):
+            u_branch = torch.tensor(u_branch, dtype=torch.float32)
+        if u_branch.ndim == 1:
+            u_branch = u_branch.unsqueeze(0)
+        self.u_branch = u_branch.to(self.branch_U_w.device)
+
+    def forward_branch(self, u=None):
+        if u is None:
+            u = self.u_branch
+        u = u.to(self.branch_U_w.dtype).to(self.branch_U_w.device)
+        U = torch.tanh(u @ self.branch_U_w + self.branch_U_b)
+        V = torch.tanh(u @ self.branch_V_w + self.branch_V_b)
+        h = u
+        for i in range(6):
+            out = torch.tanh(h @ self.branch_layers_w[i] + self.branch_layers_b[i])
+            h = out * U + (1.0 - out) * V
+        return h @ self.branch_layers_w[6] + self.branch_layers_b[6]
+
+    def forward_trunk(self, tx):
+        tx = tx.to(self.FF.dtype).to(self.FF.device)
+        proj = tx @ self.FF
+        H = torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
+        for i in range(5):
+            H = torch.tanh(H @ self.trunk_layers_w[i] + self.trunk_layers_b[i])
+        return H @ self.trunk_layers_w[5] + self.trunk_layers_b[5]
+
+    def forward(self, x, t=None, u=None):
+        """
+        Evaluate solution u(x, t) on edge.
+        Coordinates can be provided as (t, x) combined in x, or as separate x and t tensors.
+        """
+        if t is not None:
+            tx = torch.cat([t, x], dim=-1)
+        else:
+            tx = x
+        B = self.forward_branch(u)
+        T = self.forward_trunk(tx)
+        if B.ndim == 1:
+            B = B.unsqueeze(0)
+        if B.shape[0] != T.shape[0]:
+            B = B.expand(T.shape[0], -1)
+        return torch.sum(B * T, dim=-1, keepdim=True)
+
+
+class DriftDiffusionPhysics:
+    """
+    Nonlinear Drift-Diffusion PDE on a metric graph edge:
+      dt(rho) = dx(eps * dx(rho) - nu * rho * (1 - rho)) + f_target
+      Expanded: dt(rho) - eps * dxx(rho) + nu * (1 - 2*rho) * dx(rho) - f_target = 0
+    Flux:
+      J = -eps * dx(rho) + nu * rho * (1 - rho)
+    """
+    def __init__(self, edge_idx=0, eps=0.1, nu=1.0, ic_func=None, source_func=None):
+        self.edge_idx = edge_idx
+        self.eps = float(eps)
+        self.nu = float(nu)
+        self.ic_func = ic_func
+        self.source_func = source_func
+
+    def F(self, x, t, u, u_x, u_xx, dt_u, f_target=None):
+        res = dt_u - self.eps * u_xx + self.nu * (1.0 - 2.0 * u) * u_x
+        if f_target is not None:
+            res = res - f_target
+        return res
+
+    def get_flux(self, u, u_x):
+        return -self.eps * u_x + self.nu * u * (1.0 - u)
+
+    def get_ic(self, x):
+        if self.ic_func is not None:
+            return self.ic_func(x)
+        return torch.zeros_like(x)
+
+    def get_f_target(self, x, t, L_):
+        if self.source_func is not None:
+            return self.source_func(x, t)
+        return torch.zeros_like(x)
+
+
+class DecoupledAdaptiveLambdaController:
+    """
+    Decoupled Multi-Adaptive Lambda Controller based on gradient-norm balancing (Wang et al. 2021).
+    Dynamically balances PDE, IC, boundary, continuity, and Kirchhoff flux coupling losses.
+    """
+    def __init__(self, init_cont=10.0, init_flux=1.0, init_pde=1.0, init_ic=1.0,
+                 lambda_min=0.01, lambda_max=500.0, alpha=0.1, adapt_every=10):
+        self.lambda_cont = float(init_cont)
+        self.lambda_flux = float(init_flux)
+        self.lambda_pde = float(init_pde)
+        self.lambda_ic = float(init_ic)
+        self.lambda_min = float(lambda_min)
+        self.lambda_max = float(lambda_max)
+        self.alpha = float(alpha)
+        self.adapt_every = int(adapt_every)
+
+    def update(self, it, g_cont, g_flux, g_pde=None):
+        if it % self.adapt_every != 0 or it < 10:
+            return self.lambda_cont, self.lambda_flux
+
+        norm_cont = float(torch.sqrt(torch.sum(g_cont ** 2)))
+        norm_flux = float(torch.sqrt(torch.sum(g_flux ** 2)))
+
+        ratio = float(np.clip(norm_cont / max(norm_flux, 1e-12), self.lambda_min, self.lambda_max))
+        self.lambda_flux = float(np.clip((1.0 - self.alpha) * self.lambda_flux + self.alpha * ratio,
+                                         self.lambda_min, self.lambda_max))
+        return self.lambda_cont, self.lambda_flux
 
 
 def _compute_l1_matrix_vectorized(alpha, grid_np):
@@ -2175,3 +2389,199 @@ def run_parabolic_inverse(graph, physics_list, exact_u_per_edge, *, scheme='L1',
     est = solver.get_estimated_parameters()
     solver.report_l2(exact_fns)
     return (solver, est)
+
+
+class DeepONetPINNSolver(_PINNSolverBase):
+    """
+    Physics-Informed DeepONet Solver on Quantum / Metric Graphs.
+    Uses pre-trained and frozen weights & biases from the adaptive DeepONet model
+    (training_weights_biases/) as the starting point, and continues with the exact
+    QGPINNS engine architecture:
+      - Continuous space-time PDE evaluation via autograd
+      - Boundary conditions, initial conditions, and vertex interface coupling
+      - Kirchhoff nonlinear flux balance across internal junction vertices
+      - Adaptive lambda balancing (dual_v2, gradient_ratio_v2, bdmm_v2, decoupled, fixed)
+      - Two-phase training: Adam optimization followed by L-BFGS second-order polish!
+    """
+    def __init__(self, graph, physics, weights_dir='training_weights_biases', edge_types=None, branch_inputs=None, eps=0.1, t_max=1.0):
+        super().__init__(graph, physics)
+        self.weights_dir = weights_dir
+        self.edge_types = dict(edge_types) if edge_types else {}
+        self.branch_inputs = dict(branch_inputs) if branch_inputs else {}
+        self.eps = float(eps)
+        self.t_max = float(t_max)
+        self.pinn_pts = 100
+        self.n_t = 100
+        self.decoupled_controller = None
+
+    def set_mesh(self, pinn_pts=100, n_t=100, t_max=1.0):
+        self.pinn_pts = pinn_pts
+        self.n_t = n_t
+        self.t_max = t_max
+        return self
+
+    def set_branch_inputs(self, branch_inputs):
+        self.branch_inputs.update(branch_inputs)
+        if self.compiled:
+            for i, b in branch_inputs.items():
+                if i in self.models:
+                    self.models[i]['net'].set_branch_input(b)
+        return self
+
+    def _deduce_edge_type(self, edge_idx):
+        if edge_idx in self.edge_types:
+            return self.edge_types[edge_idx].lower()
+        u_node, v_node, _ = self.graph.edges[edge_idx]
+        deg = {}
+        for e in self.graph.edges:
+            deg[e[0]] = deg.get(e[0], 0) + 1
+            deg[e[1]] = deg.get(e[1], 0) + 1
+        if deg.get(u_node, 1) == 1:
+            return 'inflow'
+        if deg.get(v_node, 1) == 1:
+            return 'outflow'
+        return 'inner'
+
+    def compile(self):
+        t_np = np.linspace(0.0, self.t_max, self.n_t, dtype=np.float32)
+        self.t_grid = torch.tensor(t_np, dtype=torch.float32, device=device).view(-1, 1)
+
+        for i, edge in enumerate(self.graph.edges):
+            u_node, v_node, L = edge[0], edge[1], float(edge[2])
+            n_x = max(int(self.pinn_pts * L), 2)
+            x_np = np.linspace(0.0, L, n_x, dtype=np.float32)
+            x_grid = torch.tensor(x_np, dtype=torch.float32, device=device).view(-1, 1)
+
+            m_type = self._deduce_edge_type(i)
+            b_in = self.branch_inputs.get(i, None)
+
+            # Initialize PretrainedDeepONet with the saved weights & biases as the starting point!
+            net = PretrainedDeepONet(model_type=m_type, weights_dir=self.weights_dir, u_branch=b_in).to(device)
+
+            X_mesh = x_grid.repeat(self.n_t, 1)
+            T_mesh = self.t_grid.repeat_interleave(n_x, dim=0)
+
+            phys_i = self._physics_list[i] if self._physics_list else self.physics
+            f_target = phys_i.get_f_target(X_mesh, T_mesh, L).view(-1, 1).to(device)
+
+            self.models[i] = dict(
+                net=net,
+                L=L,
+                n_x=n_x,
+                nodes=(u_node, v_node),
+                x_grid=x_grid,
+                X_mesh=X_mesh,
+                T_mesh=T_mesh,
+                f_target=f_target,
+                physics=phys_i,
+                edge_type=m_type
+            )
+        self.compiled = True
+        return self
+
+    def predict(self, idx, x, t):
+        m = self.models[idx]
+        L = m['L']
+        x_norm = x / L
+        return m['net'](x_norm, t)
+
+    def compute_losses(self, epoch=0):
+        lp = torch.tensor(0.0, device=device)
+        ln = torch.tensor(0.0, device=device)
+        loss_junc = torch.tensor(0.0, device=device)
+
+        # 1. Edge PDE Residuals
+        for i, m in self.models.items():
+            L = m['L']
+            X = m['X_mesh'].clone().detach().requires_grad_(True)
+            T = m['T_mesh'].clone().detach().requires_grad_(True)
+            X_norm = X / L
+            TX = torch.cat([T, X_norm], dim=-1)
+
+            u_sp = m['net'].forward_trunk(TX)
+            B = m['net'].forward_branch()
+            if B.ndim == 1:
+                B = B.unsqueeze(0)
+            if B.shape[0] != u_sp.shape[0]:
+                B = B.expand(u_sp.shape[0], -1)
+            u = torch.sum(B * u_sp, dim=-1, keepdim=True)
+
+            d_tx = torch.autograd.grad(u, TX, torch.ones_like(u), create_graph=True)[0]
+            d_t = d_tx[:, 0:1]
+            d_x = d_tx[:, 1:2] / L
+            d_xx = torch.autograd.grad(d_x, TX, torch.ones_like(d_x), create_graph=True)[0][:, 1:2] / L
+
+            f_target = m['f_target']
+            res = m['physics'].F(X, T, u, d_x, d_xx, d_t, f_target)
+            lp = lp + res.pow(2).mean()
+
+        # 2. Initial Condition Loss (t = 0)
+        for i, m in self.models.items():
+            if self.constraint_mode == 'soft':
+                X_ic = m['x_grid']
+                T_ic = torch.zeros_like(X_ic)
+                u_ic = self.predict(i, X_ic, T_ic)
+                ln = ln + torch.mean((u_ic - m['physics'].get_ic(X_ic)) ** 2)
+
+        # 3. Boundary Condition Loss at Leaf/Boundary Nodes
+        deg = {}
+        for edge in self.graph.edges:
+            deg[edge[0]] = deg.get(edge[0], 0) + 1
+            deg[edge[1]] = deg.get(edge[1], 0) + 1
+
+        for i, m in self.models.items():
+            for node_idx, x_val in [(m['nodes'][0], 0.0), (m['nodes'][1], m['L'])]:
+                if deg.get(node_idx, 1) > 1:
+                    continue
+                bc_type = self.bc_types.get(node_idx, 'dirichlet')
+                T_bc = self.t_grid.clone().detach().requires_grad_(True)
+                X_bc = torch.full_like(T_bc, x_val).requires_grad_(True)
+                u_bc = self.predict(i, X_bc, T_bc)
+                if bc_type == 'dirichlet':
+                    res_bc = (u_bc - self._get_bc_value(node_idx, T_bc)).pow(2)
+                    ln = ln + res_bc.mean()
+                else:
+                    u_x_bc = torch.autograd.grad(u_bc, X_bc, torch.ones_like(u_bc), create_graph=True)[0]
+                    res_nbc = (u_x_bc - self._get_bc_value(node_idx, T_bc)).pow(2)
+                    ln = ln + res_nbc.mean()
+
+        # 4. Multi-Edge Junction Conditions (Continuity and Kirchhoff Flux Conservation)
+        for node_idx, d in deg.items():
+            if d <= 1:
+                continue
+            inc = []
+            for i, m in self.models.items():
+                if node_idx == m['nodes'][0]:
+                    inc.append((i, 0.0, 1.0))
+                if node_idx == m['nodes'][1]:
+                    inc.append((i, m['L'], -1.0))
+            if len(inc) < 2:
+                continue
+
+            T_jc = self.t_grid.clone().detach()
+            u_preds = []
+            flux = torch.zeros_like(T_jc)
+            for idx_e, xv, s in inc:
+                X_j = torch.full_like(T_jc, xv).requires_grad_(True)
+                T_j = T_jc.clone().requires_grad_(True)
+                u_j = self.predict(idx_e, X_j, T_j)
+                u_preds.append(u_j.view(-1))
+                u_x_j = torch.autograd.grad(u_j, X_j, torch.ones_like(u_j), create_graph=True)[0]
+                edge_physics = self.models[idx_e]['physics']
+                if hasattr(edge_physics, 'get_flux'):
+                    flux_val = edge_physics.get_flux(u_j, u_x_j)
+                else:
+                    flux_val = -self.eps * u_x_j + 1.0 * u_j * (1.0 - u_j)
+                flux = flux + flux_val * s
+
+            for a in range(len(u_preds)):
+                for b in range(a + 1, len(u_preds)):
+                    ln = ln + (u_preds[a] - u_preds[b]).pow(2).mean()
+
+            flux_loss = flux.pow(2).mean()
+            loss_junc = loss_junc + flux_loss
+            ln = ln + flux_loss
+
+        self._current_loss_junc = loss_junc
+        return (lp, ln)
+
