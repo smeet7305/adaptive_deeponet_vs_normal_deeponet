@@ -409,7 +409,7 @@ def plot_double_y(res, save_path):
         for e in range(ne):
             diff = np.abs(v_pred[e, :, t_idx] - v_ref[e, :, t_idx])
             ax_bot.plot(x_local, diff, color=colors[e], linewidth=1.6, label=edge_names[e])
-        ax_bot.set_title(f"Absolute Difference $|\hat{{\\rho}} - \\rho_{{ref}}|$ at {t_name}", fontsize=11, fontweight='bold')
+        ax_bot.set_title(rf"Absolute Difference $|\hat{{\rho}} - \rho_{{ref}}|$ at {t_name}", fontsize=11, fontweight='bold')
         ax_bot.set_xlabel("Local coordinate $x \\in [0, 1]$")
         ax_bot.set_ylabel("Absolute Error")
         ax_bot.grid(True, linestyle=':', alpha=0.6)

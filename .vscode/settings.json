@@ -1,0 +1,14 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/Engine",
+    "${workspaceFolder}/scratch/official_repo"
+  ],
+  "python.autoComplete.extraPaths": [
+    "${workspaceFolder}/Engine",
+    "${workspaceFolder}/scratch/official_repo"
+  ],
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportAttributeAccessIssue": "none"
+  }
+}

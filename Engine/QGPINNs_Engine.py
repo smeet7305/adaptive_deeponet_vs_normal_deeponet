@@ -2403,8 +2403,9 @@ class DeepONetPINNSolver(_PINNSolverBase):
       - Adaptive lambda balancing (dual_v2, gradient_ratio_v2, bdmm_v2, decoupled, fixed)
       - Two-phase training: Adam optimization followed by L-BFGS second-order polish!
     """
-    def __init__(self, graph, physics, weights_dir='training_weights_biases', edge_types=None, branch_inputs=None, eps=0.1, t_max=1.0):
+    def __init__(self, graph, physics, weights_dir='training_weights_biases', edge_types=None, branch_inputs=None, eps=0.1, t_max=1.0, device=None):
         super().__init__(graph, physics)
+        self.device = device if device is not None else globals()['device']
         self.weights_dir = weights_dir
         self.edge_types = dict(edge_types) if edge_types else {}
         self.branch_inputs = dict(branch_inputs) if branch_inputs else {}
@@ -2444,25 +2445,25 @@ class DeepONetPINNSolver(_PINNSolverBase):
 
     def compile(self):
         t_np = np.linspace(0.0, self.t_max, self.n_t, dtype=np.float32)
-        self.t_grid = torch.tensor(t_np, dtype=torch.float32, device=device).view(-1, 1)
+        self.t_grid = torch.tensor(t_np, dtype=torch.float32, device=self.device).view(-1, 1)
 
         for i, edge in enumerate(self.graph.edges):
             u_node, v_node, L = edge[0], edge[1], float(edge[2])
             n_x = max(int(self.pinn_pts * L), 2)
             x_np = np.linspace(0.0, L, n_x, dtype=np.float32)
-            x_grid = torch.tensor(x_np, dtype=torch.float32, device=device).view(-1, 1)
+            x_grid = torch.tensor(x_np, dtype=torch.float32, device=self.device).view(-1, 1)
 
             m_type = self._deduce_edge_type(i)
             b_in = self.branch_inputs.get(i, None)
 
             # Initialize PretrainedDeepONet with the saved weights & biases as the starting point!
-            net = PretrainedDeepONet(model_type=m_type, weights_dir=self.weights_dir, u_branch=b_in).to(device)
+            net = PretrainedDeepONet(model_type=m_type, weights_dir=self.weights_dir, u_branch=b_in).to(self.device)
 
             X_mesh = x_grid.repeat(self.n_t, 1)
             T_mesh = self.t_grid.repeat_interleave(n_x, dim=0)
 
             phys_i = self._physics_list[i] if self._physics_list else self.physics
-            f_target = phys_i.get_f_target(X_mesh, T_mesh, L).view(-1, 1).to(device)
+            f_target = phys_i.get_f_target(X_mesh, T_mesh, L).view(-1, 1).to(self.device)
 
             self.models[i] = dict(
                 net=net,
@@ -2486,9 +2487,9 @@ class DeepONetPINNSolver(_PINNSolverBase):
         return m['net'](x_norm, t)
 
     def compute_losses(self, epoch=0):
-        lp = torch.tensor(0.0, device=device)
-        ln = torch.tensor(0.0, device=device)
-        loss_junc = torch.tensor(0.0, device=device)
+        lp = torch.tensor(0.0, device=self.device)
+        ln = torch.tensor(0.0, device=self.device)
+        loss_junc = torch.tensor(0.0, device=self.device)
 
         # 1. Edge PDE Residuals
         for i, m in self.models.items():
